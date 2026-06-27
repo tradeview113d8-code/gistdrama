@@ -27,6 +27,6 @@ jobs:
     - name: Run Pipeline
       env:
         APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GHT_TOKEN }}
         GIST_ID: ${{ secrets.GIST_ID }}
       run: python main.py
