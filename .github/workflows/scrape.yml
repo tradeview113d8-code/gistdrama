@@ -2,9 +2,9 @@ name: Auto Scrape Hot News GenZ
 
 on:
   schedule:
-    # Chạy vào phút 0 của các giờ 0, 6, 12, 18 (Tức là 6 tiếng/lần)
+    # Chạy vào phút 0 của các giờ 0, 6, 12, 18 (6 tiếng/lần)
     - cron: '0 */6 * * *' 
-  workflow_dispatch: # Cho phép bấm nút chạy thủ công trên GitHub để test
+  workflow_dispatch: # Cho phép bấm chạy thủ công
 
 jobs:
   scrape-and-save:
@@ -22,10 +22,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install apify-client pymongo python-dotenv
+        pip install -r requirements.txt
 
     - name: Run Pipeline
       env:
         APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
-        MONGO_URI: ${{ secrets.MONGO_URI }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GIST_ID: ${{ secrets.GIST_ID }}
       run: python main.py
