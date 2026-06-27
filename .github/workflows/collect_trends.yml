@@ -1,0 +1,37 @@
+name: Collect TikTok Trends → Update Gist
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"   # Mỗi 4 giờ: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC
+  workflow_dispatch:          # Cho phép chạy tay để test
+
+jobs:
+  collect-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5        # Cực kỳ nhẹ — không ảnh hưởng quota repo chính
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies (siêu nhẹ)
+        run: |
+          pip install requests feedparser beautifulsoup4
+
+      - name: Collect trends & update Gist
+        env:
+          GIST_ID:    ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          python collect.py
+
+      - name: Log kết quả
+        if: always()
+        run: |
+          echo "Hoàn thành lúc $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
