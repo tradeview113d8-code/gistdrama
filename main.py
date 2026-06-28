@@ -2,13 +2,11 @@
 chimera-trend-collector / collect.py
 Thu thập trending TikTok Vietnam → format genz_hot_news.json → PATCH Gist.
 Chạy bởi GitHub Actions mỗi 4 giờ (cron: "0 */4 * * *").
-Không cần MongoDB, không cần secrets CHIMERA — chỉ cần GIST_TOKEN + GIST_ID.
 
-Chiến lược thu thập (fallback theo thứ tự):
-  1. RSS báo VN (VnExpress, Tuổi Trẻ, Kênh 14, Zing News)
-  2. Scrape Kenh14 trending HTML
-  3. TikTok RSS Bridge (qua RSSHub public)
-  4. TikTok tracking aggregator (placeholder mở rộng)
+Chiến lược thu thập (theo thứ tự ưu tiên):
+  1. TikTok qua Apify (dữ liệu THẬT: shareCount, playCount)
+  2. RSS báo VN (VnExpress, Tuổi Trẻ, Kênh 14) làm fallback
+  3. Scrape Kenh14 trending HTML
 
 Output JSON genz_hot_news.json — đúng schema T0d mong đợi.
 """
@@ -20,10 +18,11 @@ import random
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import requests
 import feedparser
+from apify_client import ApifyClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,18 +31,16 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════
 
-GIST_ID    = os.getenv("GIST_ID", "36eb2530da8921c099ddc3e571e7b55c")
-GIST_TOKEN = os.getenv("GHT_TOKEN", "")       # GitHub PAT với scope gist
-GIST_FILE  = "genz_hot_news.json"
-MAX_ITEMS  = 30                                  # Số items tối đa trong Gist
-TIMEOUT    = 10
+GIST_ID      = os.getenv("GIST_ID", "36eb2530da8921c099ddc3e571e7b55c")
+GIST_TOKEN   = os.getenv("GIST_TOKEN", "")
+APIFY_TOKEN  = os.getenv("APIFY_TOKEN", "")
+GIST_FILE    = "genz_hot_news.json"
+MAX_ITEMS    = 30
+TIMEOUT      = 10
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
-
-# ── Category keywords ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# CATEGORY & EMOTION RULES
+# ══════════════════════════════════════════════════════════════════════
 
 CATEGORY_RULES: List[tuple] = [
     ("finance",      ["nợ", "vỡ nợ", "phá sản", "bất động sản", "ngân hàng",
@@ -69,8 +66,7 @@ EMOTION_RULES: List[tuple] = [
     ("joy",     ["vui", "hạnh phúc", "tuyệt vời", "yêu", "thích"]),
 ]
 
-# ── Pattern mapping (urban_drama column từ pattern_to_chimera) ────────
-
+# Map category → pattern (từ pattern_to_chimera.json)
 PATTERN_MAP: Dict[str, str] = {
     "finance":      "economic_collapse",
     "scandal":      "hidden_truth_exposed",
@@ -102,21 +98,17 @@ def classify_emotion(text: str) -> str:
             return emotion
     return "neutral"
 
-def estimate_views(text: str, source: str) -> int:
-    """Ước tính views dựa trên từ khóa mức độ viral."""
-    viral_signals = ["viral", "hot", "trending", "triệu view", "lan truyền", "bùng nổ"]
-    high_signals  = ["nổi tiếng", "được chia sẻ", "nhiều người", "cộng đồng mạng"]
-    text_lower = text.lower()
-    if any(s in text_lower for s in viral_signals):
-        return random.randint(3_000_000, 10_000_000)
-    if any(s in text_lower for s in high_signals):
-        return random.randint(500_000, 3_000_000)
-    if source == "tiktok":
-        return random.randint(100_000, 500_000)
-    return random.randint(10_000, 100_000)
-
 def extract_hashtags(text: str) -> List[str]:
     return re.findall(r"#\w+", text)
+
+def clean_title(text: str, max_words: int = 30) -> str:
+    """Cắt title ≤ 30 từ, loại hashtag thừa."""
+    if not text:
+        return "Không có tiêu đề"
+    text = re.sub(r"#\w+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+    return " ".join(words[:max_words]).strip()
 
 def dedup(items: List[Dict]) -> List[Dict]:
     """Loại bỏ item trùng title (dựa trên hash 8 ký tự đầu)."""
@@ -129,50 +121,80 @@ def dedup(items: List[Dict]) -> List[Dict]:
             result.append(item)
     return result
 
-def clean_title(text: str, max_words: int = 30) -> str:
-    """Cắt title ≤ 30 từ, loại hashtag thừa."""
-    if not text:
-        return "Không có tiêu đề"
-    text = re.sub(r"#\w+", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    words = text.split()
-    return " ".join(words[:max_words]).strip()
-
 # ══════════════════════════════════════════════════════════════════════
-# COLLECTORS
+# COLLECTOR 1: TIKTOK VIA APIFY (NGUỒN CHÍNH)
 # ══════════════════════════════════════════════════════════════════════
 
-def _rss_to_items(url: str, source_name: str, limit: int = 10) -> List[Dict]:
-    """Helper chung: parse RSS → list items."""
+def collect_from_tiktok_apify() -> List[Dict]:
+    """
+    Cào TikTok qua Apify Actor: clockworks/tiktok-scraper
+    Lấy dữ liệu THẬT: shareCount, playCount từ TikTok.
+    Chỉ lấy video có shareCount > 500 (đảm bảo là tin HOT).
+    """
+    if not APIFY_TOKEN:
+        logger.warning("⚠️ APIFY_TOKEN trống — bỏ qua Apify")
+        return []
+
     items = []
     try:
-        feed = feedparser.parse(url)
-        for entry in feed.entries[:limit]:
-            title   = entry.get("title", "")
-            summary = entry.get("summary", "")
-            full    = f"{title} {summary}"
-            if not title:
+        client = ApifyClient(APIFY_TOKEN)
+        
+        # Input cho TikTok Scraper
+        run_input = {
+            "searchQueries": ["#hongbien", "#drama", "#bocphot", "#xuhuong", "#var"],
+            "resultsPerPage": 30,
+            "maxResultsQueries": 15,
+            "shouldDownloadVideos": False,
+            "shouldDownloadCovers": False,
+        }
+        
+        logger.info("⏳ Đang gọi Apify cào TikTok (mất 2-3 phút)...")
+        run = client.actor("clockworks/tiktok-scraper").call(run_input=run_input)
+        
+        # Lấy dữ liệu từ Dataset
+        for item in client.dataset(run["defaultDatasetId"]).iterate_items():
+            share_count = item.get("shareCount", 0)
+            play_count = item.get("playCount", 0)
+            
+            # Lọc: Chỉ lấy video có > 500 shares (tin HOT thật sự)
+            if share_count < 500:
                 continue
-            cat = classify_category(full)
+            
+            raw_title = item.get("text", "")
+            if not raw_title or len(raw_title) < 10:
+                continue
+            
+            # Dùng shareCount làm views (hoặc playCount nếu muốn)
+            views = share_count * 100  # Ước tính views từ shares
+            
+            cat = classify_category(raw_title)
             items.append({
-                "title":          clean_title(title),
-                "hashtags":       extract_hashtags(full),
-                "views":          estimate_views(full, "news"),
-                "category":       cat,
-                "emotion":        classify_emotion(full),
-                "pattern":        PATTERN_MAP.get(cat, "moral_dilemma"),
-                "raw_text":       summary[:200],
-                "_source":        source_name,
-                "_published":     entry.get("published", ""),
+                "title":      clean_title(raw_title, 30),
+                "hashtags":   extract_hashtags(raw_title),
+                "views":      views,
+                "category":   cat,
+                "emotion":    classify_emotion(raw_title),
+                "pattern":    PATTERN_MAP.get(cat, "moral_dilemma"),
+                "raw_text":   raw_title[:200],
+                "_source":    "tiktok_apify",
+                "_tiktok_id": item.get("id"),
+                "_link":      item.get("webVideoUrl"),
             })
-        logger.info(f"[RSS] {source_name}: {len(feed.entries)} entries → {len(items)} items")
+        
+        logger.info(f"[TikTok-Apify] Lấy được {len(items)} video hot (shareCount > 500)")
+        
     except Exception as e:
-        logger.warning(f"[RSS] Lỗi {url}: {e}")
+        logger.error(f"[TikTok-Apify] Lỗi: {e}")
+    
     return items
 
+# ══════════════════════════════════════════════════════════════════════
+# COLLECTOR 2: RSS BÁO VN (FALLBACK)
+# ══════════════════════════════════════════════════════════════════════
 
 def collect_from_rss() -> List[Dict]:
-    """Nguồn 1: RSS báo VN chính thống."""
+    """Fallback: RSS VnExpress + Tuổi Trẻ + Kênh 14."""
+    items = []
     feeds = [
         ("https://vnexpress.net/rss/tin-moi-nhat.rss",  "vnexpress"),
         ("https://vnexpress.net/rss/giai-tri.rss",       "vnexpress_ent"),
@@ -180,105 +202,109 @@ def collect_from_rss() -> List[Dict]:
         ("https://tuoitre.vn/rss/giai-tri.rss",          "tuoitre_ent"),
         ("https://kenh14.vn/rss/home.rss",               "kenh14"),
         ("https://kenh14.vn/rss/showbiz.rss",            "kenh14_showbiz"),
-        ("https://kenh14.vn/rss/star.rss",               "kenh14_star"),
-        ("https://zingnews.vn/rss/giai-tri.rss",         "zingnews_ent"),
     ]
-    items = []
-    for url, name in feeds:
-        items.extend(_rss_to_items(url, name))
+    
+    for url, source_name in feeds:
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:10]:
+                title   = entry.get("title", "")
+                summary = entry.get("summary", "")
+                full    = f"{title} {summary}"
+                
+                if not title:
+                    continue
+                
+                # Ước tính views cho RSS (vì không có số thật)
+                viral_signals = ["viral", "hot", "trending", "triệu view", "lan truyền"]
+                if any(s in full.lower() for s in viral_signals):
+                    views = random.randint(1_000_000, 5_000_000)
+                else:
+                    views = random.randint(50_000, 500_000)
+                
+                cat = classify_category(full)
+                items.append({
+                    "title":      clean_title(title, 30),
+                    "hashtags":   extract_hashtags(full),
+                    "views":      views,
+                    "category":   cat,
+                    "emotion":    classify_emotion(full),
+                    "pattern":    PATTERN_MAP.get(cat, "moral_dilemma"),
+                    "raw_text":   summary[:200],
+                    "_source":    source_name,
+                })
+            
+            logger.info(f"[RSS] {source_name}: {len(feed.entries)} entries")
+            
+        except Exception as e:
+            logger.warning(f"[RSS] Lỗi {url}: {e}")
+    
     return items
 
+# ══════════════════════════════════════════════════════════════════════
+# COLLECTOR 3: KENH14 HTML SCRAPE (FALLBACK)
+# ══════════════════════════════════════════════════════════════════════
 
 def collect_from_kenh14_html() -> List[Dict]:
-    """Nguồn 2: Scrape Kenh14 trending HTML."""
+    """Scrape Kenh14 trending HTML."""
     items = []
     try:
+        from html.parser import HTMLParser
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "vi,vi-VN;q=0.9",
+        }
+        
         resp = requests.get(
             "https://kenh14.vn/tag/trending.chn",
             timeout=TIMEOUT,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "vi,vi-VN;q=0.9"},
+            headers=headers
         )
+        
         if resp.status_code != 200:
             return items
-
-        from html.parser import HTMLParser
-
+        
         class TitleExtractor(HTMLParser):
             def __init__(self):
                 super().__init__()
-                self.titles: List[str] = []
+                self.titles = []
                 self._in_title = False
-
+            
             def handle_starttag(self, tag, attrs):
                 attrs_dict = dict(attrs)
                 cls = attrs_dict.get("class", "")
                 if tag == "h3" and "knl-card__title" in cls:
                     self._in_title = True
-
+            
             def handle_data(self, data):
                 if self._in_title and data.strip():
                     self.titles.append(data.strip())
                     self._in_title = False
-
+        
         parser = TitleExtractor()
         parser.feed(resp.text)
+        
         for title in parser.titles[:15]:
             if len(title) > 10:
                 cat = classify_category(title)
                 items.append({
-                    "title":      clean_title(title),
+                    "title":      clean_title(title, 30),
                     "hashtags":   extract_hashtags(title),
-                    "views":      estimate_views(title, "social"),
+                    "views":      random.randint(100_000, 1_000_000),
                     "category":   cat,
                     "emotion":    classify_emotion(title),
                     "pattern":    PATTERN_MAP.get(cat, "moral_dilemma"),
                     "raw_text":   title,
                     "_source":    "kenh14_trending",
-                    "_published": "",
                 })
-        logger.info(f"[Kenh14 HTML] Scraped {len(parser.titles)} titles → {len(items)} items")
+        
+        logger.info(f"[Kenh14 HTML] Scraped {len(parser.titles)} titles")
+        
     except Exception as e:
         logger.warning(f"[Kenh14 HTML] Lỗi: {e}")
+    
     return items
-
-
-def collect_from_tiktok_rsshub() -> List[Dict]:
-    """Nguồn 3: TikTok qua RSSHub public bridge."""
-    items = []
-    # Các kênh TikTok GenZ VN phổ biến
-    channels = [
-        "beatvn_official",
-        "welax",
-        "yeah1com",
-        "yan.vn",
-        "tintuc24h",
-    ]
-    rsshub_base = "https://rsshub.app/tiktok/user"
-
-    for channel in channels:
-        url = f"{rsshub_base}/@{channel}"
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:5]:
-                title = entry.get("title", "")
-                if title:
-                    cat = classify_category(title)
-                    items.append({
-                        "title":      clean_title(title),
-                        "hashtags":   extract_hashtags(title),
-                        "views":      estimate_views(title, "tiktok"),
-                        "category":   cat,
-                        "emotion":    classify_emotion(title),
-                        "pattern":    PATTERN_MAP.get(cat, "moral_dilemma"),
-                        "raw_text":   entry.get("summary", "")[:200],
-                        "_source":    f"tiktok_{channel}",
-                        "_published": entry.get("published", ""),
-                    })
-            logger.info(f"[TikTok-RSSHub] @{channel}: {len(feed.entries)} entries")
-        except Exception as e:
-            logger.warning(f"[TikTok-RSSHub] @{channel} lỗi: {e}")
-    return items
-
 
 # ══════════════════════════════════════════════════════════════════════
 # MAIN COLLECT
@@ -288,41 +314,41 @@ def collect_all() -> List[Dict]:
     """Tổng hợp từ tất cả nguồn, dedup, sort by views."""
     all_items: List[Dict] = []
     logger.info("=== Bắt đầu thu thập trend ===")
-
-    # 1. RSS báo VN (luôn chạy, ổn định nhất)
+    
+    # 1. TikTok qua Apify (NGUỒN CHÍNH - dữ liệu thật)
+    tt = collect_from_tiktok_apify()
+    logger.info(f"🎵 TikTok Apify: {len(tt)} items")
+    all_items.extend(tt)
+    
+    # 2. RSS báo VN (FALLBACK)
     rss = collect_from_rss()
     logger.info(f"📰 RSS: {len(rss)} items")
     all_items.extend(rss)
-
-    # 2. Kenh14 HTML trending
+    
+    # 3. Kenh14 HTML (FALLBACK)
     k14 = collect_from_kenh14_html()
     logger.info(f"🔥 Kenh14 HTML: {len(k14)} items")
     all_items.extend(k14)
-
-    # 3. TikTok qua RSSHub
-    tt = collect_from_tiktok_rsshub()
-    logger.info(f"🎵 TikTok RSSHub: {len(tt)} items")
-    all_items.extend(tt)
-
+    
     # Dedup, sort by views desc, giới hạn MAX_ITEMS
     deduped = dedup(all_items)
     deduped.sort(key=lambda x: x.get("views", 0), reverse=True)
-
-    # Bỏ field internal (_source, _published)
+    
+    # Bỏ field internal (_source, _tiktok_id, _link)
     final = []
     for item in deduped[:MAX_ITEMS]:
         clean = {k: v for k, v in item.items() if not k.startswith("_")}
         final.append(clean)
-
+    
     logger.info(f"✅ Tổng sau dedup: {len(final)} / {len(all_items)} raw items")
     return final
 
 # ══════════════════════════════════════════════════════════════════════
-# BUILD GIST JSON (đúng schema genz_hot_news_schema.json)
+# BUILD GIST JSON
 # ══════════════════════════════════════════════════════════════════════
 
 def build_gist_payload(items: List[Dict]) -> Dict:
-    """Tạo payload đúng schema T0d mong đợi."""
+    """Tạo payload đúng schema genz_hot_news_schema.json."""
     return {
         "updated_at":  datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source":      "tiktok_vn",
@@ -340,7 +366,7 @@ def update_gist(content: str) -> bool:
     if not GIST_TOKEN:
         logger.error("❌ GIST_TOKEN trống — không thể update Gist")
         return False
-
+    
     url = f"https://api.github.com/gists/{GIST_ID}"
     headers = {
         "Authorization":        f"Bearer {GIST_TOKEN}",
@@ -352,7 +378,7 @@ def update_gist(content: str) -> bool:
             GIST_FILE: {"content": content}
         }
     }
-
+    
     try:
         resp = requests.patch(url, headers=headers, json=payload, timeout=15)
         resp.raise_for_status()
@@ -375,12 +401,12 @@ if __name__ == "__main__":
     if not items:
         logger.error("⚠️ Không có item nào — hủy update Gist để tránh ghi rỗng")
         exit(1)
-
+    
     # 2. Build payload
     payload = build_gist_payload(items)
     content = json.dumps(payload, ensure_ascii=False, indent=2)
     logger.info(f"📦 Payload size: {len(content.encode())} bytes")
-
+    
     # 3. Dry-run preview (5 items đầu)
     logger.info("🔍 Preview 5 items đầu:")
     for item in items[:5]:
@@ -389,7 +415,7 @@ if __name__ == "__main__":
             f"[{item.get('pattern', '?'):20s}] "
             f"views={item['views']:>9,} | {item['title'][:60]}"
         )
-
+    
     # 4. Update Gist
     success = update_gist(content)
     exit(0 if success else 1)
