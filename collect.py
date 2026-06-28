@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════
 
 GIST_ID      = os.getenv("GIST_ID", "36eb2530da8921c099ddc3e571e7b55c")
-GIST_TOKEN   = os.getenv("GIST_TOKEN", "")
+GIST_TOKEN   = os.getenv("GHT_TOKEN", "")
 APIFY_TOKEN  = os.getenv("APIFY_TOKEN", "")
 GIST_FILE    = "genz_hot_news.json"
 MAX_ITEMS    = 30
